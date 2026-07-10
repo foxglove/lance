@@ -132,8 +132,19 @@ parquet = { version = "58", default-features = false, features = ["arrow", "asyn
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo", "datafusion-extra-functions"]
 fp16kernels = ["lance-linalg/fp16kernels"]
+# DataFusion scalar-function packs that Lance does not reference itself; they
+# exist only so user filter expressions can call those functions at runtime.
+# Split out as default-on, pass-through features so consumers that don't need
+# them can build with `default-features = false` and drop the crates they pull
+# in (blake2/blake3/md-5/sha2 via crypto, base64/hex via encoding, unicode
+# case-folding/segmentation tables via unicode). `regex`/`string` are not
+# included here because lance-index depends on them at compile time.
+datafusion-extra-functions = ["datafusion-crypto", "datafusion-encoding", "datafusion-unicode"]
+datafusion-crypto = ["datafusion/crypto_expressions"]
+datafusion-encoding = ["datafusion/encoding_expressions"]
+datafusion-unicode = ["datafusion/unicode_expressions"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]

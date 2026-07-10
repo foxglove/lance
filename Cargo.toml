@@ -117,15 +117,19 @@ criterion = { version = "0.5", features = [
 ] }
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
+# NOTE: crypto/encoding/unicode expression packs are intentionally NOT enabled
+# here. They are not referenced by Lance's own code (only exposed so user filter
+# strings can call those functions at runtime) and pull in heavy crates
+# (blake2/blake3/md-5/sha2 via crypto, etc.). They are re-enabled by default via
+# the `lance` crate's `datafusion-extra-functions` feature, so builds that opt
+# out (default-features = false) can drop them. `regex`/`string` stay on because
+# lance-index references them at compile time.
 datafusion = { version = "53.0.0", default-features = false, features = [
-    "crypto_expressions",
     "datetime_expressions",
-    "encoding_expressions",
     "nested_expressions",
     "regex_expressions",
     "sql",
     "string_expressions",
-    "unicode_expressions",
 ] }
 datafusion-common = "53.0.0"
 datafusion-functions = { version = "53.0.0", features = ["regex_expressions"] }
