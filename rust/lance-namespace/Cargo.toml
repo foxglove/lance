@@ -11,6 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Re-export the generated REST API client (`apis`) and pull in its reqwest
+# stack. Off by default so consumers that only touch directory namespaces
+# (which use `models` only) don't compile reqwest/url.
+client = ["lance-namespace-reqwest-client/client"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true

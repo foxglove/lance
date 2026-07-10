@@ -34,7 +34,10 @@ pub mod models {
     pub use lance_namespace_reqwest_client::models::*;
 }
 
-// Re-export APIs from the reqwest client
+// Re-export APIs from the reqwest client. Gated behind `client` because the
+// generated `apis` module pulls in the reqwest/url stack; directory namespaces
+// only need `models`.
+#[cfg(feature = "client")]
 pub mod apis {
     pub use lance_namespace_reqwest_client::apis::*;
 }
