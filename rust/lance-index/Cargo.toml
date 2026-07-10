@@ -71,7 +71,6 @@ twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
-lance-datagen.workspace = true
 rangemap.workspace = true
 
 [dev-dependencies]
@@ -80,6 +79,9 @@ criterion.workspace = true
 env_logger = "0.11.6"
 geo-traits.workspace = true
 lance-datagen.workspace = true
+# Tests/benches use lance_datafusion::datagen, which is gated behind its
+# `datagen` feature (kept off in normal builds to avoid pulling lance-datagen).
+lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true

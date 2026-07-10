@@ -27,7 +27,7 @@ futures.workspace = true
 jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
-lance-datagen.workspace = true
+lance-datagen = {workspace = true, optional = true}
 lance-geo = {workspace = true, optional = true}
 chrono.workspace = true
 log.workspace = true
@@ -47,6 +47,11 @@ lance-datagen.workspace = true
 geo = ["dep:lance-geo"]
 substrait = ["dep:datafusion-substrait"]
 protoc = ["dep:protobuf-src"]
+# Exposes the `datagen` module (DatafusionDatagenExt). Only used by test code
+# across the workspace, so it is gated off by default to keep `lance-datagen`
+# out of downstream builds. The crate's own tests reach it via `cfg(test)` plus
+# the dev-dependency; other crates enable this feature in their dev-dependencies.
+datagen = ["dep:lance-datagen"]
 
 [lints]
 workspace = true
