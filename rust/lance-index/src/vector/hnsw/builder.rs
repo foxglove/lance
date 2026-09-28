@@ -651,8 +651,12 @@ impl Graph for HnswLevelView<'_> {
     }
 
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
-        let node = &self.nodes[key as usize];
-        node.read().unwrap().level_neighbors[self.level as usize].clone()
+        let node = self.nodes[key as usize].read().unwrap();
+        let level = self.level as usize;
+        if level >= node.level_neighbors.len() {
+            return Arc::new(Vec::new());
+        }
+        node.level_neighbors[level].clone()
     }
 }
 
@@ -673,7 +677,12 @@ impl Graph for ImmutableHnswLevelView<'_> {
     }
 
     fn neighbors(&self, key: u32) -> Arc<Vec<u32>> {
-        self.nodes[key as usize].level_neighbors[self.level as usize].clone()
+        let lists = &self.nodes[key as usize].level_neighbors;
+        let level = self.level as usize;
+        if level >= lists.len() {
+            return Arc::new(Vec::new());
+        }
+        lists[level].clone()
     }
 }
 
@@ -683,7 +692,12 @@ impl BorrowingGraph for ImmutableHnswLevelView<'_> {
     }
 
     fn neighbors(&self, key: u32) -> &[u32] {
-        self.nodes[key as usize].level_neighbors[self.level as usize].as_slice()
+        let lists = &self.nodes[key as usize].level_neighbors;
+        let level = self.level as usize;
+        if level >= lists.len() {
+            return &[];
+        }
+        lists[level].as_slice()
     }
 }
 
@@ -775,6 +789,11 @@ impl IvfSubIndex for HNSW {
         for i in 0..bottom_level_len {
             nodes.push(GraphBuilderNode::new(i as u32, levels.len()));
         }
+        // Highest level each node actually appears on. `new` allocates every
+        // level for every node, and `to_batch` would then emit empty rows for
+        // levels the node is not on. Those empty lists blow past the 32KiB
+        // miniblock limit when the partition is rewritten.
+        let mut top_level = vec![0u16; bottom_level_len];
         for (level, batch) in levels.into_iter().enumerate() {
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
@@ -793,7 +812,16 @@ impl IvfSubIndex for HNSW {
                     .map(|(n, dist)| OrderedNode::new(n.unwrap(), OrderedFloat(dist.unwrap())))
                     .collect();
                 nodes[node as usize].update_from_ranked_neighbors(level as u16);
+                let top = &mut top_level[node as usize];
+                if level as u16 > *top {
+                    *top = level as u16;
+                }
             }
+        }
+        for (node, top) in nodes.iter_mut().zip(top_level) {
+            let keep = top as usize + 1;
+            node.level_neighbors.truncate(keep);
+            node.level_neighbors_ranked.truncate(keep);
         }
 
         let visited_generator_queue =
