@@ -10,9 +10,10 @@
 //! selection the repair uses on newer Lance (Algorithm 4, including pruned
 //! connections, trimmed to the pre-deletion degree). 7.0.0's builder does not
 //! refill from pruned candidates; this selection does, because that is the
-//! repair.
+//! repair. After that trim, level-0 nodes with no path from the entry point
+//! are linked the same way the newer builder links stranded nodes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use arrow::array::{ArrayBuilder, AsArray, Float32Builder, ListBuilder, UInt32Builder};
@@ -425,6 +426,10 @@ fn level_from_rows<S: VectorStore>(
 
 /// Remap a graph and replace edges that pointed at deleted nodes.
 ///
+/// Reciprocal trimming can drop the only inbound edge of a node. Search only
+/// walks level 0 from the entry point, so those nodes are then linked with
+/// `connect_stranded_level0`.
+///
 /// `storage` is the remapped partition, in the new local-id order `new_ids`
 /// assigns. With no deletions the caller clones the graph and does not call
 /// this. A repair that cannot be applied returns an error so the caller can
@@ -463,6 +468,16 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
         .ok_or_else(|| Error::internal("HNSW repair kept nodes on no level".to_string()))?;
     let ef = parsed.metadata.params.ef_construction.min(kept.max(1));
     reselect_damaged(&mut levels, entry_point, ef, storage);
+    {
+        let mut level0 = Level0Adj::new(&mut levels[0]);
+        connect_stranded_level0(
+            &mut level0,
+            entry_point,
+            parsed.metadata.params.ef_construction,
+            storage,
+        );
+    }
+    refresh_search_ids(&mut levels[0]);
 
     let mut id_builder = UInt32Builder::with_capacity(parsed.num_rows);
     let mut neighbors_builder = ListBuilder::with_capacity(
@@ -510,4 +525,296 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
             Arc::new(distances_builder.finish()),
         ],
     )?)
+}
+
+/// Level-0 graph `connect_stranded_level0` reads and extends.
+trait Level0Links {
+    fn len(&self) -> usize;
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>>;
+    fn ranked(&self, id: u32) -> Vec<OrderedNode>;
+    fn link(&mut self, anchor: OrderedNode, node: u32);
+}
+
+/// Level 0 of a repaired graph, as the stranded-node linker sees it.
+struct Level0Adj<'a> {
+    edges: &'a mut [Vec<(u32, f32)>],
+    ids: Vec<Arc<Vec<u32>>>,
+}
+
+impl<'a> Level0Adj<'a> {
+    fn new(level: &'a mut LevelAdj) -> Self {
+        let ids = level
+            .neighbors
+            .iter()
+            .map(|edges| Arc::new(edges.iter().map(|(id, _)| *id).collect()))
+            .collect();
+        Self {
+            edges: level.neighbors.as_mut_slice(),
+            ids,
+        }
+    }
+}
+
+impl Level0Links for Level0Adj<'_> {
+    fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>> {
+        self.ids[id as usize].clone()
+    }
+
+    fn ranked(&self, id: u32) -> Vec<OrderedNode> {
+        self.edges[id as usize]
+            .iter()
+            .map(|(id, dist)| OrderedNode::new(*id, (*dist).into()))
+            .collect()
+    }
+
+    fn link(&mut self, anchor: OrderedNode, node: u32) {
+        self.edges[anchor.id as usize].push((node, anchor.dist.0));
+        let ids = Arc::new(
+            self.edges[anchor.id as usize]
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+        );
+        self.ids[anchor.id as usize] = ids;
+    }
+}
+
+/// Give every level-0 node an inbound path from the entry point.
+///
+/// This is the linker the newer builder runs after a parallel insert. The
+/// anchor gets one extra edge and does not drop a neighbor. Each node anchors
+/// at most one stranded node. The walk that picks the anchor is capped at
+/// `ef_construction` hops.
+fn connect_stranded_level0<G: Level0Links, S: VectorStore>(
+    graph: &mut G,
+    entry_point: u32,
+    ef_construction: usize,
+    storage: &S,
+) {
+    let n = graph.len();
+    let mut reachable = vec![false; n];
+    mark_level0_reachable(graph, entry_point, &mut reachable);
+
+    let stranded: Vec<u32> = (0..n as u32)
+        .filter(|node| !reachable[*node as usize])
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+
+    let mut waiting_on: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &node in &stranded {
+        for &neighbor in graph.neighbors(node).iter() {
+            if !reachable[neighbor as usize] {
+                waiting_on.entry(neighbor).or_default().push(node);
+            }
+        }
+    }
+
+    let mut anchored = vec![false; n];
+    let mut chain_tail: Option<u32> = None;
+    let mut isolated = Vec::new();
+    let mut ready: VecDeque<u32> = stranded.iter().copied().collect();
+    while let Some(node) = ready.pop_front() {
+        if reachable[node as usize] {
+            continue;
+        }
+        let dist_calc = storage.dist_calculator_from_id(node);
+        let mut candidates: Vec<OrderedNode> = graph
+            .ranked(node)
+            .into_iter()
+            .filter(|neighbor| reachable[neighbor.id as usize])
+            .collect();
+        let Some(nearest) = candidates.iter().min().cloned() else {
+            isolated.push(node);
+            continue;
+        };
+
+        let mut closest = nearest.clone();
+        for _ in 0..ef_construction {
+            let step = graph
+                .neighbors(closest.id)
+                .iter()
+                .filter(|neighbor| reachable[**neighbor as usize])
+                .map(|&neighbor| OrderedNode::new(neighbor, dist_calc.distance(neighbor).into()))
+                .min();
+            match step {
+                Some(step) if step.dist < closest.dist => closest = step,
+                _ => break,
+            }
+        }
+
+        candidates.sort_unstable();
+        let anchor = std::iter::once(closest)
+            .chain(candidates)
+            .find(|candidate| !anchored[candidate.id as usize])
+            .or_else(|| {
+                chain_tail.map(|tail| OrderedNode::new(tail, dist_calc.distance(tail).into()))
+            })
+            .unwrap_or(nearest);
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        for newly_reachable in mark_level0_reachable(graph, node, &mut reachable) {
+            if let Some(waiting) = waiting_on.remove(&newly_reachable) {
+                ready.extend(waiting);
+            }
+        }
+    }
+
+    for node in isolated {
+        if reachable[node as usize] {
+            continue;
+        }
+        let anchor = chain_tail.unwrap_or(entry_point);
+        let anchor = OrderedNode::new(anchor, storage.dist_between(anchor, node).into());
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        mark_level0_reachable(graph, node, &mut reachable);
+    }
+}
+
+fn mark_level0_reachable<G: Level0Links>(
+    graph: &G,
+    start: u32,
+    reachable: &mut [bool],
+) -> Vec<u32> {
+    let mut newly_reachable = Vec::new();
+    if reachable[start as usize] {
+        return newly_reachable;
+    }
+    let mut queue = VecDeque::new();
+    reachable[start as usize] = true;
+    queue.push_back(start);
+    while let Some(current) = queue.pop_front() {
+        newly_reachable.push(current);
+        for &neighbor in graph.neighbors(current).iter() {
+            if !reachable[neighbor as usize] {
+                reachable[neighbor as usize] = true;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    newly_reachable
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use arrow::array::AsArray;
+    use arrow::compute::take;
+    use arrow::datatypes::UInt32Type;
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::DistanceType;
+
+    use super::{VECTOR_ID_COL, remap_graph_repair};
+    use crate::vector::flat::storage::FlatFloatStorage;
+    use crate::vector::graph::NEIGHBORS_COL;
+    use crate::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams, HnswQueryParams};
+    use crate::vector::hnsw::{HNSW, HnswMetadata};
+    use crate::vector::v3::subindex::IvfSubIndex;
+
+    const DIM: usize = 16;
+
+    /// Deleting from a graph of identical vectors drops the only inbound edge of
+    /// many nodes. The repair links each of them back, and a wide search can
+    /// return them.
+    #[test]
+    fn test_repair_keeps_survivors_reachable() {
+        const N: usize = 500;
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0f32; N * DIM]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(4).ef_construction(4),
+        )
+        .unwrap();
+        let batch = hnsw.to_batch().unwrap();
+
+        let mut new_ids = Vec::with_capacity(N);
+        let mut kept_idx = Vec::new();
+        for old_id in 0..N {
+            if old_id % 100 == 0 {
+                new_ids.push(None);
+            } else {
+                new_ids.push(Some(kept_idx.len() as u32));
+                kept_idx.push(old_id as u32);
+            }
+        }
+        let kept = take(&vectors, &UInt32Array::from(kept_idx), None).unwrap();
+        let kept = kept.as_fixed_size_list().clone();
+        let kept_store = FlatFloatStorage::new(kept, DistanceType::L2);
+
+        let repaired = remap_graph_repair(&batch, &new_ids, &kept_store).unwrap();
+        let (reached, total) = reachable_from_entry(&repaired);
+        assert_eq!(reached, total, "repair left nodes stranded");
+        assert_eq!(total, N - N / 100);
+
+        let params = HnswQueryParams {
+            ef: 300,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let hits = HNSW::load(repaired)
+            .unwrap()
+            .search_basic(vectors.value(0), 300, &params, None, &kept_store)
+            .unwrap()
+            .len();
+        assert_eq!(hits, 300);
+    }
+
+    fn reachable_from_entry(batch: &RecordBatch) -> (usize, usize) {
+        let meta: HnswMetadata =
+            serde_json::from_str(&batch.schema_ref().metadata()[HNSW_METADATA_KEY]).unwrap();
+        let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
+        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
+        let level0 = meta.level_offsets[1];
+        let n = ids.values()[..level0].iter().copied().max().unwrap_or(0) as usize + 1;
+        let mut adj = vec![Vec::new(); n];
+        let mut present = vec![false; n];
+        for row in 0..level0 {
+            let id = ids.value(row) as usize;
+            present[id] = true;
+            adj[id] = neighbors
+                .value(row)
+                .as_primitive::<UInt32Type>()
+                .values()
+                .to_vec();
+        }
+        let mut reachable = vec![false; n];
+        let mut queue = VecDeque::new();
+        let entry = meta.entry_point as usize;
+        if entry < n {
+            reachable[entry] = true;
+            queue.push_back(entry);
+        }
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in &adj[current] {
+                let neighbor = neighbor as usize;
+                if neighbor < n && !reachable[neighbor] {
+                    reachable[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let total = present.iter().filter(|on| **on).count();
+        let reached = present
+            .iter()
+            .zip(&reachable)
+            .filter(|(on, reached)| **on && **reached)
+            .count();
+        (reached, total)
+    }
 }
