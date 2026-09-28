@@ -33,6 +33,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::hnsw::remap::remap_graph_repair;
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -114,6 +115,55 @@ fn apply_centroid_splits(
         concatenated,
         original.value_length(),
     )?)
+}
+
+/// Carry an HNSW graph across compaction.
+///
+/// No deleted rows: the graph is cloned. Deleted rows: surviving edges are kept
+/// and each damaged node is reconnected by [`remap_graph_repair`]. The caller
+/// rebuilds the partition if that repair cannot be applied.
+fn remap_hnsw_graph<S, Store>(
+    index: &S,
+    old_storage: &Store,
+    new_storage: &Store,
+    mapping: &HashMap<u64, Option<u64>>,
+) -> Result<(S, &'static str)>
+where
+    S: IvfSubIndex + Clone,
+    Store: VectorStore + Sync,
+{
+    let mut new_of_old = Vec::with_capacity(old_storage.len());
+    let mut new_len = 0u32;
+    let mut dropped = 0usize;
+    for row_id in old_storage.row_ids() {
+        match mapping.get(row_id) {
+            Some(None) => {
+                new_of_old.push(None);
+                dropped += 1;
+            }
+            Some(Some(_)) | None => {
+                new_of_old.push(Some(new_len));
+                new_len += 1;
+            }
+        }
+    }
+    if new_of_old.len() != old_storage.len() || new_len as usize != new_storage.len() {
+        return Err(Error::invalid_input(format!(
+            "hnsw keep-mask length {} dropped {dropped} kept {new_len} does not match storage {} -> {}",
+            new_of_old.len(),
+            old_storage.len(),
+            new_storage.len()
+        )));
+    }
+    if dropped == 0 {
+        return Ok((index.clone(), "reuse"));
+    }
+    if new_len == 0 {
+        return Ok((S::load(RecordBatch::new_empty(S::schema()))?, "empty"));
+    }
+    let batch = index.to_batch()?;
+    let repaired = remap_graph_repair(&batch, &new_of_old, new_storage)?;
+    Ok((S::load(repaired)?, "repair"))
 }
 
 // Builder for IVF index
@@ -324,7 +374,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(self.merged_num)
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>
+    where
+        S: Clone,
+    {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -353,8 +406,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         Error::internal("failed to downcast partition entry".to_string()),
                     )?;
 
+                    let started = std::time::Instant::now();
+                    let old_len = part.storage.len();
                     let storage = part.storage.remap(&mapping)?;
-                    let index = part.index.remap(&mapping, &storage)?;
+                    let (index, mode) = if S::name() == "HNSW" {
+                        match remap_hnsw_graph(&part.index, &part.storage, &storage, &mapping) {
+                            Ok(remapped) => remapped,
+                            Err(err) => {
+                                log::warn!(
+                                    "hnsw graph repair failed for partition {part_id}: {err}; rebuilding"
+                                );
+                                (part.index.remap(&mapping, &storage)?, "rebuild")
+                            }
+                        }
+                    } else {
+                        (part.index.remap(&mapping, &storage)?, "subindex-remap")
+                    };
+                    log::info!(
+                        "remap partition {part_id} mode={mode} old_len={old_len} new_len={} elapsed_s={:.3}",
+                        storage.len(),
+                        started.elapsed().as_secs_f64()
+                    );
                     Result::Ok(Some((storage, index, 0.0)))
                 }
             });
